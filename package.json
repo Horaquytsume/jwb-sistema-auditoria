@@ -1,0 +1,29 @@
+{
+  "name": "jwb-sistema-auditoria",
+  "version": "1.0.0",
+  "description": "Sistema Corporativo JWB - auditoria SHA-256, planilhas, PDFs e API",
+  "type": "module",
+  "main": "server/server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "concurrently -k -n api,web \"node server/server.js\" \"vite --host 0.0.0.0\"",
+    "dev:web": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "vite": "^6.1.0"
+  }
+}
