@@ -1,5 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +11,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT) || 3001;
 const PRODUCTION = process.env.NODE_ENV === 'production';
 const DEMO = process.env.DEMO ? process.env.DEMO === '1' : !PRODUCTION;
-const SECRET = process.env.TOKEN_SECRET || (!PRODUCTION ? 'jwb-local-development-only-change-me-32chars' : '');
+const SECRET = process.env.TOKEN_SECRET || (!PRODUCTION ? crypto.randomBytes(32).toString('hex') : '');
 if (!SECRET || (PRODUCTION && SECRET.length < 32)) throw new Error('Defina TOKEN_SECRET com pelo menos 32 caracteres no ambiente de produção.');
 const dbFile = path.resolve(process.env.DB_FILE || path.join(ROOT, 'jwb.db'));
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
@@ -82,7 +83,10 @@ if (!db.prepare('SELECT 1 FROM users LIMIT 1').get()) {
     const insertPermission = db.prepare('INSERT OR IGNORE INTO rbac(role, permission, enabled) VALUES (?,?,?)');
     for (const [role, permissions] of Object.entries(RBAC)) for (const [name, enabled] of Object.entries(permissions)) insertPermission.run(role, name, enabled ? 1 : 0);
     const insertSector = db.prepare('INSERT OR IGNORE INTO sectors(id, data) VALUES (?,?)');
-    for (const sector of SECTORS) insertSector.run(sector.id, JSON.stringify(sector));
+    for (const sector of SECTORS) {
+      const data = DEMO ? sector : { id: sector.id, name: sector.name, description: 'Setor a configurar pela empresa', manager: '', budget: null, baseSpent: null };
+      insertSector.run(sector.id, JSON.stringify(data));
+    }
     if (DEMO) for (const event of EVENTS) appendEvent(event.log, event.kind, event.actor, event.data, new Date(Date.now() - event.h * 3600e3).toISOString());
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -93,7 +97,7 @@ async function readBody(req) {
   const chunks = []; let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1_000_000) throw new Error('Corpo da requisição excede 1 MB');
+    if (size > 3_000_000) throw new Error('Corpo da requisição excede 3 MB');
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
@@ -144,7 +148,7 @@ const server = http.createServer(async (req, res) => {
     let body = {};
     if (req.method === 'POST') {
       try { body = await readBody(req); }
-      catch (error) { return json(res, error.message.includes('1 MB') ? 413 : 400, { error: error.message }); }
+      catch (error) { return json(res, error.message.includes('3 MB') ? 413 : 400, { error: error.message }); }
     }
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const ip = req.socket.remoteAddress || 'unknown';
@@ -168,13 +172,31 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/me' && req.method === 'GET') return json(res, 200, { id: user.id, name: user.name, email: user.email, role: user.role, demo: DEMO, aiEnabled: Boolean(process.env.OPENAI_API_KEY) });
     if (url.pathname === '/api/sectors' && req.method === 'GET') {
       const allowed = scopedSectorIds(user);
-      const sectors = SECTORS.filter((sector) => allowed.includes(sector.id));
+      const sectors = db.prepare('SELECT data FROM sectors ORDER BY id').all().map((row) => JSON.parse(row.data)).filter((sector) => allowed.includes(sector.id));
       return json(res, 200, sectors.map((sector) => user.role === 'assistant' ? { ...sector, budget: undefined, baseSpent: undefined } : sector));
     }
     if (url.pathname === '/api/employees' && req.method === 'GET') {
       if (user.role === 'assistant') return json(res, 403, { error: 'Seu perfil não tem permissão para consultar indicadores de colaboradores.' });
       const allowed = scopedSectorIds(user);
-      return json(res, 200, EMPLOYEES.filter((employee) => allowed.includes(employee.sectorId)));
+      return json(res, 200, DEMO ? EMPLOYEES.filter((employee) => allowed.includes(employee.sectorId)) : []);
+    }
+    if (url.pathname === '/api/documents/extract' && req.method === 'POST') {
+      if (typeof body.name !== 'string' || typeof body.base64 !== 'string' || body.base64.length > 2_666_672) return json(res, 400, { error: 'Arquivo inválido ou acima de 2 MB.' });
+      try {
+        const result = await new Promise((resolve, reject) => {
+          const child = spawn(process.env.PYTHON_BIN || 'python3', [path.join(ROOT, 'python_engine', 'extract.py')], { stdio: ['pipe', 'pipe', 'pipe'] });
+          let output = ''; let errorOutput = ''; let settled = false;
+          const timer = setTimeout(() => { child.kill('SIGKILL'); if (!settled) { settled = true; reject(new Error('Processamento excedeu 30 segundos.')); } }, 30_000);
+          child.stdout.on('data', (chunk) => { output += chunk; if (output.length > 1_000_000) child.kill('SIGKILL'); });
+          child.stderr.on('data', (chunk) => { errorOutput += chunk.toString().slice(0, 1000); });
+          child.on('error', (err) => { clearTimeout(timer); if (!settled) { settled = true; reject(err); } });
+          child.on('close', () => { clearTimeout(timer); if (settled) return; settled = true; try { resolve(JSON.parse(output)); } catch { reject(new Error(errorOutput || 'Extrator Python indisponível.')); } });
+          child.stdin.on('error', () => {});
+          child.stdin.end(JSON.stringify({ name: body.name.slice(0, 200), base64: body.base64 }));
+        });
+        if (!result.ok) return json(res, 422, { error: result.error || 'Falha na extração.' });
+        return json(res, 200, result);
+      } catch (error) { console.error('Document processor error:', error.message); return json(res, 503, { error: 'Processador de documentos indisponível.' }); }
     }
     if (url.pathname === '/api/audit/verify' && req.method === 'GET') {
       if (user.role !== 'ceo') return json(res, 403, { error: 'A verificação integral da cadeia é restrita à diretoria.' });
