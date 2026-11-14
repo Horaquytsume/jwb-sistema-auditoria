@@ -63,6 +63,11 @@ try {
   const sectors = await (await request(`${base}/api/sectors`, { headers: authHeaders })).json();
   assert.equal(sectors.length, 4);
   const fileHash = 'a'.repeat(64);
+  const extracted = await request(`${base}/api/documents/extract`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ name: 'teste.txt', base64: Buffer.from('Teste R$ 12,50').toString('base64') }) });
+  assert.equal(extracted.status, 200, 'API deve executar o extrator Python');
+  const extractedBody = await extracted.json();
+  assert.equal(extractedBody.text, 'Teste R$ 12,50');
+  assert.match(extractedBody.fileHash, /^[a-f0-9]{64}$/);
   const auditResponse = await request(`${base}/api/audit`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ fileName: 'teste.csv', fileHash, total: 12.5, market: 10, itemCount: 1 }) });
   assert.equal(auditResponse.status, 201);
   const inserted = await auditResponse.json();
