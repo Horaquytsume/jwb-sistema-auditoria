@@ -26,8 +26,21 @@ Os demais usuários demonstrativos são `carlos@demo.com`, `fernanda@demo.com` e
 
 ## Funcionalidades e limites
 
-- Login, setores e trilha de auditoria usam a API e banco SQLite local (`jwb.db`).
+- Login, setores e trilha de auditoria usam a API e banco SQLite local (`jwb.db`). O projeto é um protótipo e não está validado para dados reais ou produção.
 - Cada arquivo auditado registra metadados e hash SHA-256 em eventos encadeados.
-- Importa XLSX, XLS, ODS, CSV, TSV e TXT; PDFs com camada de texto também são lidos. PDF digitalizado como imagem exige OCR, que não está incluído.
-- A referência de preços é demonstrativa, não é uma cotação em tempo real.
-- Para produção, configure `TOKEN_SECRET` persistente, restrinja `CORS_ORIGIN`, altere as senhas de demonstração e configure armazenamento e cópias de segurança do banco.
+- Importa XLSX, CSV, TSV e TXT (converta XLS e ODS para XLSX); PDFs com camada de texto também são lidos. PDF digitalizado como imagem exige OCR, que não está incluído.
+- A referência de preços é demonstrativa, não é uma cotação em tempo real; a extração de valores pode duplicar totais e precisa de conferência humana.
+- A revisão com IA é opcional e **sugestiva**: exige `OPENAI_API_KEY` no servidor; nunca aplica alterações sem confirmação humana. O texto enviado é transmitido ao provedor de IA configurado.
+- A tela Ferramentas permite verificar a cadeia de hashes e exportar a trilha como CSV.
+- Hash encadeado torna alterações detectáveis se a cadeia original estiver preservada; não é armazenamento WORM e um administrador com acesso ao SQLite pode reconstruí-la. Faça backups externos imutáveis.
+- Antes de produção são necessários testes, auditoria de segurança independente, HTTPS, política de acesso, backups externos testados e correção das vulnerabilidades restantes. Configure `TOKEN_SECRET` persistente, `CEO_INITIAL_PASSWORD` e `DEMO=0`. Não utilize dados ou senhas de demonstração em produção.
+
+## Deploy com Docker
+
+```bash
+cp .env.example .env
+# edite .env: defina TOKEN_SECRET (32+ caracteres) e CEO_INITIAL_PASSWORD (12+ caracteres)
+docker compose up --build -d
+```
+
+Abra `http://localhost:3001`. O SQLite fica no volume persistente `jwb-data`. Para usar o modo IA, acrescente `OPENAI_API_KEY` ao `.env`. PDFs de imagem ainda precisam de OCR. O mesmo container pode ser implantado em Railway, Render, Fly.io ou outro host Docker **desde que tenha volume persistente** montado em `/data`; SQLite em disco efêmero perde os dados ao reiniciar ou substituir a instância. Para alta disponibilidade e múltiplas instâncias, migre para PostgreSQL antes do deploy.

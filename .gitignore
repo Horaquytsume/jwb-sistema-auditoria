@@ -1,5 +1,8 @@
 node_modules/
 dist/
 jwb.db
+jwb.db-shm
+jwb.db-wal
 .env
 .DS_Store
+coverage/

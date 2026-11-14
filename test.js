@@ -69,6 +69,9 @@ try {
   assert.match(inserted.hash, /^[a-f0-9]{64}$/);
   const auditRows = await (await request(`${base}/api/audit`, { headers: authHeaders })).json();
   assert.ok(auditRows.some((row) => row.log === inserted.log && row.data.fileHash === fileHash));
+  const verificationResponse = await request(`${base}/api/audit/verify`, { headers: authHeaders });
+  assert.equal(verificationResponse.status, 200);
+  assert.equal((await verificationResponse.json()).ok, true);
   const denied = await request(`${base}/api/audit`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ fileName: 'no.csv', fileHash }) });
   assert.equal(denied.status, 401);
   console.log('Testes concluídos: dados, API, login, autorização e persistência da auditoria.');

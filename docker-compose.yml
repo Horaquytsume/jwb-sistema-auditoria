@@ -1,0 +1,22 @@
+services:
+  jwb:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:3001"
+    environment:
+      NODE_ENV: production
+      DEMO: "0"
+      PORT: "3001"
+      DB_FILE: /data/jwb.db
+      TOKEN_SECRET: ${TOKEN_SECRET:?Defina TOKEN_SECRET no .env}
+      CEO_INITIAL_PASSWORD: ${CEO_INITIAL_PASSWORD:?Defina CEO_INITIAL_PASSWORD no .env}
+      CEO_EMAIL: ${CEO_EMAIL:-ceo@demo.com}
+      CEO_NAME: ${CEO_NAME:-Administrador JWB}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1/chat/completions}
+    volumes:
+      - jwb-data:/data
+volumes:
+  jwb-data:
