@@ -39,7 +39,7 @@ const checkPw = (password, stored) => {
 };
 const mac = (payload) => crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
 const issue = (user) => {
-  const payload = Buffer.from(JSON.stringify({ id: user.id, exp: Date.now() + 12 * 3600e3 })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ id: user.id, ver: mac(user.pass), exp: Date.now() + 12 * 3600e3 })).toString('base64url');
   return `${payload}.${mac(payload)}`;
 };
 const lastEvent = db.prepare('SELECT hash FROM events ORDER BY seq DESC LIMIT 1');
@@ -65,7 +65,11 @@ function auditChain() {
 if (PRODUCTION) {
   const productionPassword = process.env.CEO_INITIAL_PASSWORD;
   if (!productionPassword || productionPassword.length < 12) throw new Error('Configure CEO_INITIAL_PASSWORD com pelo menos 12 caracteres em produção.');
-  const adminEmail = String(process.env.CEO_EMAIL || 'ceo@demo.com').toLowerCase();
+  const adminEmail = String(process.env.CEO_EMAIL || 'ceo@demo.com').trim().toLowerCase();
+  const demoCeo = db.prepare("SELECT id,email,pass FROM users WHERE email = 'ceo@demo.com' AND active = 1").get();
+  if (demoCeo && adminEmail !== demoCeo.email && checkPw('trocar-esta-senha', demoCeo.pass)) {
+    throw new Error('Banco de demonstração detectado: migre manualmente a conta CEO para produção antes de iniciar.');
+  }
   for (const row of db.prepare('SELECT id,email,pass FROM users').all()) {
     if (row.email === adminEmail && checkPw('trocar-esta-senha', row.pass)) db.prepare('UPDATE users SET pass=? WHERE id=?').run(hashPw(productionPassword), row.id);
     else if (row.email !== adminEmail && (row.email === 'carlos@demo.com' || row.email === 'fernanda@demo.com' || row.email === 'lucas@demo.com') && checkPw('trocar-esta-senha', row.pass)) db.prepare('UPDATE users SET active=0 WHERE id=?').run(row.id);
@@ -112,7 +116,10 @@ function authenticate(req) {
   try {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!Number.isFinite(claims.exp) || claims.exp < Date.now()) return null;
-    return db.prepare('SELECT id, name, email, role, sector_ids FROM users WHERE id = ? AND active = 1').get(claims.id) || null;
+    const user = db.prepare('SELECT id, name, email, role, sector_ids, pass FROM users WHERE id = ? AND active = 1').get(claims.id);
+    if (!user || typeof claims.ver !== 'string' || claims.ver !== mac(user.pass)) return null;
+    delete user.pass;
+    return user;
   } catch { return null; }
 }
 function scopedSectorIds(user) { return user.role === 'ceo' ? SECTORS.map((s) => s.id) : String(user.sector_ids || '').split(',').filter(Boolean); }
