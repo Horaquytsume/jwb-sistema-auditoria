@@ -53,3 +53,8 @@ Abra `http://localhost:3001`. O SQLite fica no volume persistente `jwb-data`. Pa
 O servidor Node autentica usuários, controla acesso e recebe o arquivo; o processo Python extrai texto de PDF e planilhas, calcula SHA-256 e não executa instruções dos documentos. A análise de valores é heurística e sujeita a erros. Arquivos digitalizados precisam de OCR, não incluído. A integração não substitui uma revisão de segurança, adequação à LGPD, controle de acesso completo, backups testados e validação com a empresa.
 
 O repositório contém instruções de implantação mas não é uma solução homologada de produção. O deploy e a IA exigem configuração e testes específicos da conta.
+
+
+## Paginação e proteção de login
+
+A trilha carrega até 50 eventos por página; use **Carregar mais eventos** para consultar páginas anteriores. O CSV inclui apenas eventos carregados. O limite de tentativas é persistido no SQLite e compartilhado por processos que usem o mesmo banco; ele usa o endereço da conexão, sem confiar em cabeçalhos forjáveis. Atrás de um proxy, vários usuários podem compartilhar esse endereço: configure também limitação no proxy confiável e monitore bloqueios. Testes de carga, restauração de backup e segurança independente continuam necessários.

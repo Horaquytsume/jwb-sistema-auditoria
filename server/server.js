@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT NOT NULL, email 
 CREATE TABLE IF NOT EXISTS sectors(id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rbac(role TEXT NOT NULL, permission TEXT NOT NULL, enabled INTEGER NOT NULL, PRIMARY KEY(role, permission));
 CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, log_id TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, ts TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_events_log_seq ON events(log_id, seq DESC);
+CREATE TABLE IF NOT EXISTS login_limits(ip_hash TEXT PRIMARY KEY, count INTEGER NOT NULL, window_until INTEGER NOT NULL, blocked_until INTEGER NOT NULL);
 `);
 const sha = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const hashPw = (password) => { const salt = crypto.randomBytes(16).toString('hex'); return `${salt}:${crypto.scryptSync(password, salt, 32).toString('hex')}`; };
@@ -123,7 +125,12 @@ function authenticate(req) {
   } catch { return null; }
 }
 function scopedSectorIds(user) { return user.role === 'ceo' ? SECTORS.map((s) => s.id) : String(user.sector_ids || '').split(',').filter(Boolean); }
-const loginFailures = new Map();
+// SQLite-backed, shared by processes using the same database and persists across restarts.
+// In production a trusted reverse proxy also needs its own rate limiter.
+let loginCounter = 0;
+const findLoginLimit = db.prepare('SELECT count, window_until AS windowUntil, blocked_until AS blockedUntil FROM login_limits WHERE ip_hash = ?');
+const saveLoginLimit = db.prepare('INSERT INTO login_limits (ip_hash, count, window_until, blocked_until) VALUES (?, ?, ?, ?) ON CONFLICT(ip_hash) DO UPDATE SET count=excluded.count, window_until=excluded.window_until, blocked_until=excluded.blocked_until');
+const clearLoginLimit = db.prepare('DELETE FROM login_limits WHERE ip_hash = ?');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.json': 'application/json; charset=utf-8' };
 async function serveFrontend(req, res, pathname) {
   if (req.method !== 'GET' || !PRODUCTION) return false;
@@ -158,16 +165,20 @@ const server = http.createServer(async (req, res) => {
       catch (error) { return json(res, error.message.includes('3 MB') ? 413 : 400, { error: error.message }); }
     }
     if (url.pathname === '/api/login' && req.method === 'POST') {
-      const ip = req.socket.remoteAddress || 'unknown';
-      const lock = loginFailures.get(ip);
-      if (lock?.blockedUntil > Date.now()) return json(res, 429, { error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' });
+      // Deliberately do not trust X-Forwarded-For from arbitrary clients.
+      const ip = sha(req.socket.remoteAddress || 'unknown');
+      const now = Date.now();
+      if (++loginCounter % 100 === 0) db.prepare('DELETE FROM login_limits WHERE window_until <= ? AND blocked_until <= ?').run(now, now);
+      const lock = findLoginLimit.get(ip);
+      if (lock?.blockedUntil > now) return json(res, 429, { error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' });
       const user = db.prepare('SELECT * FROM users WHERE email = ? AND active = 1').get(String(body.email || '').trim().toLowerCase());
       if (!user || !checkPw(body.password, user.pass)) {
-        const failures = (lock && lock.windowUntil > Date.now() ? lock.count : 0) + 1;
-        loginFailures.set(ip, { count: failures, windowUntil: Date.now() + 10 * 60_000, blockedUntil: failures >= 8 ? Date.now() + 10 * 60_000 : 0 });
+        const failures = (lock && lock.windowUntil > now ? lock.count : 0) + 1;
+        const windowUntil = lock && lock.windowUntil > now ? lock.windowUntil : now + 10 * 60_000;
+        saveLoginLimit.run(ip, failures, windowUntil, failures >= 8 ? now + 10 * 60_000 : 0);
         return json(res, 401, { error: 'E-mail ou senha inválidos' });
       }
-      loginFailures.delete(ip);
+      clearLoginLimit.run(ip);
       return json(res, 200, { token: issue(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } });
     }
 
@@ -210,14 +221,24 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, auditChain());
     }
     if (url.pathname === '/api/audit' && req.method === 'GET') {
-      const allowed = scopedSectorIds(user);
-      const allRows = db.prepare('SELECT seq, log_id AS log, kind, actor, data, ts, prev_hash AS prevHash, hash FROM events ORDER BY seq').all()
-        .map((row) => ({ ...row, data: JSON.parse(row.data) }));
-      const logSectors = new Map();
-      for (const row of allRows) if (row.data.sectorId) logSectors.set(row.log, row.data.sectorId);
-      const records = allRows.filter((row) => user.role === 'ceo' || allowed.includes(row.data.sectorId || logSectors.get(row.log) || ''))
-        .sort((a, b) => b.seq - a.seq);
-      return json(res, 200, records);
+      const requestedLimit = Number(url.searchParams.get('limit') || 50);
+      const beforeParam = url.searchParams.get('before');
+      const before = beforeParam === null ? Number.MAX_SAFE_INTEGER : Number(beforeParam);
+      if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100 || !Number.isSafeInteger(before) || before < 1) return json(res, 400, { error: 'Paginação inválida.' });
+      const columns = 'e.seq, e.log_id AS log, e.kind, e.actor, e.data, e.ts, e.prev_hash AS prevHash, e.hash';
+      let rows;
+      if (user.role === 'ceo') {
+        rows = db.prepare(`SELECT ${columns} FROM events e WHERE e.seq < ? ORDER BY e.seq DESC LIMIT ?`).all(before, requestedLimit + 1);
+      } else {
+        const allowed = scopedSectorIds(user);
+        if (!allowed.length) return json(res, 200, { records: [], nextBefore: null });
+        const placeholders = allowed.map(() => '?').join(',');
+        // For legacy events with no sector, use the most recent sector attached to the same log.
+        rows = db.prepare(`SELECT ${columns} FROM events e WHERE e.seq < ? AND COALESCE(json_extract(e.data, '$.sectorId'), (SELECT json_extract(x.data, '$.sectorId') FROM events x WHERE x.log_id = e.log_id AND json_extract(x.data, '$.sectorId') IS NOT NULL ORDER BY x.seq DESC LIMIT 1), '') IN (${placeholders}) ORDER BY e.seq DESC LIMIT ?`).all(before, ...allowed, requestedLimit + 1);
+      }
+      const hasMore = rows.length > requestedLimit;
+      const page = rows.slice(0, requestedLimit).map((row) => ({ ...row, data: JSON.parse(row.data) }));
+      return json(res, 200, { records: page, nextBefore: hasMore ? page[page.length - 1].seq : null });
     }
     if (url.pathname === '/api/audit' && req.method === 'POST') {
       if (typeof body.fileName !== 'string' || typeof body.fileHash !== 'string' || !/^[a-f0-9]{64}$/i.test(body.fileHash)) return json(res, 400, { error: 'Nome do arquivo e hash SHA-256 válido são obrigatórios.' });
