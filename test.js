@@ -26,7 +26,7 @@ const base = `http://127.0.0.1:${port}`;
 function request(url, options = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
-    const req = http.request({ hostname: target.hostname, port: target.port, path: target.pathname, method: options.method || 'GET', headers: options.headers || {} }, (res) => {
+    const req = http.request({ hostname: target.hostname, port: target.port, path: target.pathname + target.search, method: options.method || 'GET', headers: options.headers || {} }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
@@ -72,8 +72,24 @@ try {
   assert.equal(auditResponse.status, 201);
   const inserted = await auditResponse.json();
   assert.match(inserted.hash, /^[a-f0-9]{64}$/);
-  const auditRows = await (await request(`${base}/api/audit`, { headers: authHeaders })).json();
+  const auditPage = await (await request(`${base}/api/audit?limit=1`, { headers: authHeaders })).json();
+  const auditRows = auditPage.records;
+  assert.equal(auditRows.length, 1);
+  assert.ok(auditPage.nextBefore);
+  const secondPage = await (await request(`${base}/api/audit?limit=1&before=${auditPage.nextBefore}`, { headers: authHeaders })).json();
+  assert.equal(secondPage.records.length, 1);
+  assert.notEqual(auditRows[0].seq, secondPage.records[0].seq);
+  const invalidPage = await request(`${base}/api/audit?limit=101`, { headers: authHeaders });
+  assert.equal(invalidPage.status, 400);
   assert.ok(auditRows.some((row) => row.log === inserted.log && row.data.fileHash === fileHash));
+  const managerLogin = await request(`${base}/api/login`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email: 'carlos@demo.com', password: 'trocar-esta-senha' }) });
+  assert.equal(managerLogin.status, 200);
+  const managerToken = (await managerLogin.json()).token;
+  const managerRows = (await (await request(`${base}/api/audit`, { headers: { authorization: `Bearer ${managerToken}` } })).json()).records;
+  assert.ok(managerRows.length >= 1);
+  assert.ok(managerRows.every((row) => row.data.sectorId === 'operacoes' || row.log === 'LOG-904'));
+  const managerVerify = await request(`${base}/api/audit/verify`, { headers: { authorization: `Bearer ${managerToken}` } });
+  assert.equal(managerVerify.status, 403);
   const verificationResponse = await request(`${base}/api/audit/verify`, { headers: authHeaders });
   assert.equal(verificationResponse.status, 200);
   assert.equal((await verificationResponse.json()).ok, true);
@@ -85,6 +101,12 @@ try {
   assert.equal(relogin.status, 200, 'A nova senha deve permitir novo login');
   const denied = await request(`${base}/api/audit`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ fileName: 'no.csv', fileHash }) });
   assert.equal(denied.status, 401);
+  for (let i = 0; i < 8; i++) {
+    const failed = await request(`${base}/api/login`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email: 'ceo@demo.com', password: 'errada' }) });
+    assert.equal(failed.status, 401);
+  }
+  const blocked = await request(`${base}/api/login`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email: 'ceo@demo.com', password: 'nova-senha-forte-123' }) });
+  assert.equal(blocked.status, 429, 'Bloqueio deve persistir na base SQLite');
   console.log('Testes concluídos: dados, API, login, autorização e persistência da auditoria.');
 } finally {
   server.kill('SIGTERM');
