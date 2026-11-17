@@ -77,6 +77,12 @@ try {
   const verificationResponse = await request(`${base}/api/audit/verify`, { headers: authHeaders });
   assert.equal(verificationResponse.status, 200);
   assert.equal((await verificationResponse.json()).ok, true);
+  const changed = await request(`${base}/api/account/password`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ currentPassword: 'trocar-esta-senha', newPassword: 'nova-senha-forte-123' }) });
+  assert.equal(changed.status, 200, 'A troca de senha deve funcionar');
+  const staleSession = await request(`${base}/api/me`, { headers: authHeaders });
+  assert.equal(staleSession.status, 401, 'Troca de senha deve revogar sessões existentes');
+  const relogin = await request(`${base}/api/login`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email: 'ceo@demo.com', password: 'nova-senha-forte-123' }) });
+  assert.equal(relogin.status, 200, 'A nova senha deve permitir novo login');
   const denied = await request(`${base}/api/audit`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ fileName: 'no.csv', fileHash }) });
   assert.equal(denied.status, 401);
   console.log('Testes concluídos: dados, API, login, autorização e persistência da auditoria.');
