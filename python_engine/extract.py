@@ -11,6 +11,8 @@ import zipfile
 MAX_BYTES = 2_000_000
 MAX_TEXT = 200_000
 MAX_ROWS = 20_000
+MAX_COLUMNS = 500
+MAX_CELLS = 200_000
 MAX_ZIP_UNCOMPRESSED = 30_000_000
 
 
@@ -41,20 +43,39 @@ def extract_document(name, payload):
             workbook = load_workbook(io.BytesIO(payload), read_only=True, data_only=True, keep_links=False)
             chunks = []
             row_count = 0
+            cell_count = 0
+            text_size = 0
+            truncated = False
             for sheet in workbook.worksheets:
+                if sheet.max_column > MAX_COLUMNS:
+                    raise ValueError('Planilha excede o limite de 500 colunas.')
                 chunks.append(f'Planilha: {sheet.title}')
                 for row in sheet.iter_rows(values_only=True):
                     row_count += 1
                     if row_count > MAX_ROWS:
                         raise ValueError('Planilha excede o limite de 20 mil linhas.')
+                    cell_count += len(row)
+                    if cell_count > MAX_CELLS:
+                        raise ValueError('Planilha excede o limite de 200 mil células.')
                     cells = []
                     for cell in row:
                         if cell is None: cells.append('')
                         elif isinstance(cell, (int, float)) and not isinstance(cell, bool): cells.append(str(cell))
                         else: cells.append(str(cell))
-                    chunks.append(' | '.join(cells))
+                    line = ' | '.join(cells)
+                    remaining = MAX_TEXT - text_size
+                    if len(line) + 1 > remaining:
+                        chunks.append(line[:max(0, remaining)])
+                        truncated = True
+                        break
+                    chunks.append(line)
+                    text_size += len(line) + 1
+                if truncated:
+                    break
             workbook.close()
             text = '\n'.join(chunks)
+            if truncated:
+                notes.append('Texto truncado em 200 mil caracteres; a análise precisa de conferência.')
         except zipfile.BadZipFile as exc:
             raise ValueError('Planilha XLSX inválida.') from exc
     elif extension in ('.csv', '.tsv', '.txt'):
