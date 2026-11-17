@@ -54,6 +54,7 @@ export default function App() {
   const [fileHash, setFileHash] = useState('');
   const [sectors, setSectors] = useState([]);
   const [records, setRecords] = useState([]);
+  const [nextBefore, setNextBefore] = useState(null);
   const [employees, setEmployees] = useState([]);
   const [integrity, setIntegrity] = useState(null);
   const [aiReview, setAiReview] = useState(null);
@@ -65,7 +66,7 @@ export default function App() {
     const staff = me.role === 'assistant' ? [] : await request('/api/employees', token);
     const next = { token, user: me };
     setSession(next); setAiEnabled(Boolean(me.aiEnabled)); localStorage.setItem(STORE_KEY, JSON.stringify(next));
-    setSectors(sectorRows); setRecords(auditRows); setEmployees(staff);
+    setSectors(sectorRows); setRecords(auditRows.records); setNextBefore(auditRows.nextBefore); setEmployees(staff);
   }, []);
   useEffect(() => {
     let cancelled = false;
@@ -74,7 +75,7 @@ export default function App() {
         try {
           const [me, sectorRows, auditRows] = await Promise.all([request('/api/me', session.token), request('/api/sectors', session.token), request('/api/audit', session.token)]);
           const staff = me.role === 'assistant' ? [] : await request('/api/employees', session.token);
-          if (!cancelled) { const next = { token: session.token, user: me }; setAiEnabled(Boolean(me.aiEnabled)); setSession(next); localStorage.setItem(STORE_KEY, JSON.stringify(next)); setSectors(sectorRows); setRecords(auditRows); setEmployees(staff); }
+          if (!cancelled) { const next = { token: session.token, user: me }; setAiEnabled(Boolean(me.aiEnabled)); setSession(next); localStorage.setItem(STORE_KEY, JSON.stringify(next)); setSectors(sectorRows); setRecords(auditRows.records); setNextBefore(auditRows.nextBefore); setEmployees(staff); }
         } catch { if (!cancelled) { setSession(null); localStorage.removeItem(STORE_KEY); } }
       }
       if (!cancelled) setChecking(false);
@@ -87,12 +88,22 @@ export default function App() {
     catch (error) { setNotice(error.message); }
     finally { setBusy(false); }
   }
-  function logout() { setSession(null); setRecords([]); setSectors([]); setEmployees([]); localStorage.removeItem(STORE_KEY); }
+  function logout() { setSession(null); setRecords([]); setNextBefore(null); setSectors([]); setEmployees([]); localStorage.removeItem(STORE_KEY); }
   async function reviewWithAI() {
     if (!window.confirm('O texto atual será enviado ao provedor de IA configurado. Não envie dados confidenciais sem autorização. Deseja continuar?')) return;
     setBusy(true); setNotice(''); setAiReview(null);
     try { const result = await request('/api/ai/review', session.token, { method: 'POST', body: JSON.stringify({ text: content }) }); setAiReview(result); setNotice('A IA preparou uma sugestão. Confira antes de aplicar; nada foi alterado automaticamente.'); }
     catch (error) { setNotice(error.message); }
+    finally { setBusy(false); }
+  }
+  async function loadMoreAudit() {
+    if (!nextBefore) return;
+    setBusy(true); setNotice('');
+    try {
+      const page = await request(`/api/audit?before=${encodeURIComponent(nextBefore)}`, session.token);
+      setRecords((old) => [...old, ...page.records]);
+      setNextBefore(page.nextBefore);
+    } catch (error) { setNotice(error.message); }
     finally { setBusy(false); }
   }
   async function verifyIntegrity() {
@@ -107,8 +118,8 @@ export default function App() {
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a'); link.href = url; link.download = 'jwb-trilha-auditoria.csv'; link.click(); URL.revokeObjectURL(url);
   }
-  async function analyze(text = content, name = 'texto-colado.txt', exactBytes = null) {
-    if (!text.trim()) { setNotice('O documento está vazio ou não contém texto extraível.'); return; }
+  async function analyze(text = content, name = 'texto-colado.txt', exactBytes = null, extractionNotes = []) {
+    if (!text.trim()) { setNotice(['O documento está vazio ou não contém texto extraível.', ...extractionNotes].join(' ')); setBusy(false); return; }
     setBusy(true); setNotice('');
     try {
       const hash = await sha256(exactBytes || text);
@@ -116,14 +127,14 @@ export default function App() {
       setContent(text); setReport(nextReport); setFileHash(hash);
       const logged = await request('/api/audit', session.token, { method: 'POST', body: JSON.stringify({ fileName: name, fileHash: hash, total: nextReport.total, market: nextReport.market, itemCount: nextReport.items.length, sectorId: sectors[0]?.id }) });
       setRecords((old) => [{ seq: `new-${logged.log}`, log: logged.log, kind: 'document_audited', actor: session.user.name, data: { fileName: name, fileHash: hash, total: nextReport.total, itemCount: nextReport.items.length }, ts: logged.ts, hash: logged.hash }, ...old]);
-      setNotice(`Análise registrada na trilha de auditoria (${logged.log}).`);
+      setNotice([`Análise registrada na trilha de auditoria (${logged.log}).`, ...extractionNotes].join(' '));
     } catch (error) { setNotice(`Não foi possível concluir a análise: ${error.message}`); }
     finally { setBusy(false); }
   }
   async function handleFile(file) {
     if (!file) return;
     setBusy(true); setNotice('Lendo documento…');
-    try { const extracted = await extractFile(file, session.token); if (extracted.notes.length) setNotice(extracted.notes.join(' ')); await analyze(extracted.text, file.name, extracted.bytes); }
+    try { const extracted = await extractFile(file, session.token); await analyze(extracted.text, file.name, extracted.bytes, extracted.notes); }
     catch (error) { setNotice(`Falha ao ler arquivo: ${error.message}`); setBusy(false); }
   }
 
@@ -133,13 +144,13 @@ export default function App() {
   return <main style={styles.page}>
     <header style={styles.header}><div><div style={styles.brand}>JWB <span>• Sistema Corporativo</span></div><p style={styles.muted}>{session.user.name} · {session.user.role}</p></div><button style={styles.secondary} onClick={logout}>Sair</button></header>
     <nav style={styles.nav}>{[['dashboard', 'Painel'], ['attachments', 'Documentos'], ['audit', `Trilha (${records.length})`], ['tools', 'Ferramentas']].map(([id, label]) => <button key={id} onClick={() => setTab(id)} style={{ ...styles.tab, ...(tab === id ? styles.activeTab : {}) }}>{label}</button>)}</nav>
-    {tab === 'dashboard' && <><section style={styles.grid}>{sectors.map((sector) => <article key={sector.id} style={styles.panel}><h2>{sector.name}</h2><p style={styles.muted}>{sector.description}</p>{Number.isFinite(sector.budget) && <p>Orçamento: <strong>{money(sector.budget)}</strong></p>}<small>Responsável: {sector.manager}</small></article>)}</section><section style={{ ...styles.panel, ...styles.wide }}><h2>Resumo</h2><p>{records.length} eventos na trilha de auditoria. Setores disponíveis para seu perfil: {sectors.length}.</p><button style={styles.primary} onClick={() => setTab('attachments')}>Analisar documento</button></section>{employees.length > 0 && <section style={{ ...styles.panel, ...styles.wide }}><h2>Indicadores da equipe</h2><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Colaborador</th><th>Setor</th><th>Pontuação base</th><th>Entrega no prazo</th><th>Status</th></tr></thead><tbody>{employees.map((person) => <tr key={person.id}><td>{person.name}</td><td>{person.sector}</td><td>{person.baseScore}%</td><td>{person.onTimeRate}%</td><td>{person.status}</td></tr>)}</tbody></table></div><p style={styles.warning}>Indicadores de demonstração: confirme as informações antes de usá-las para decisões de pessoal.</p></section>}</>}
+    {tab === 'dashboard' && <><section style={styles.grid}>{sectors.map((sector) => <article key={sector.id} style={styles.panel}><h2>{sector.name}</h2><p style={styles.muted}>{sector.description}</p>{Number.isFinite(sector.budget) && <p>Orçamento: <strong>{money(sector.budget)}</strong></p>}<small>Responsável: {sector.manager}</small></article>)}</section><section style={{ ...styles.panel, ...styles.wide }}><h2>Resumo</h2><p>{records.length} eventos carregados da trilha de auditoria. Setores disponíveis para seu perfil: {sectors.length}.</p><button style={styles.primary} onClick={() => setTab('attachments')}>Analisar documento</button></section>{employees.length > 0 && <section style={{ ...styles.panel, ...styles.wide }}><h2>Indicadores da equipe</h2><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Colaborador</th><th>Setor</th><th>Pontuação base</th><th>Entrega no prazo</th><th>Status</th></tr></thead><tbody>{employees.map((person) => <tr key={person.id}><td>{person.name}</td><td>{person.sector}</td><td>{person.baseScore}%</td><td>{person.onTimeRate}%</td><td>{person.status}</td></tr>)}</tbody></table></div><p style={styles.warning}>Indicadores de demonstração: confirme as informações antes de usá-las para decisões de pessoal.</p></section>}</>}
     {tab === 'attachments' && <section style={styles.grid}>
       <div style={styles.panel}><h2>Auditoria de documento</h2><label style={styles.label}>Selecionar PDF, planilha ou texto<input type="file" accept=".pdf,.xlsx,.csv,.tsv,.txt,application/pdf,text/csv" onChange={(event) => handleFile(event.target.files?.[0])} style={styles.file}/></label><p style={styles.muted}>PDF com texto selecionável, XLSX, CSV, TSV e TXT. XLS e ODS devem ser convertidos para XLSX.</p><label style={styles.label} htmlFor="doc">Ou cole o texto</label><textarea id="doc" value={content} onChange={(event) => setContent(event.target.value)} rows={12} style={styles.textarea}/><button style={styles.primary} disabled={busy} onClick={() => analyze(content)}>{busy ? 'Processando…' : 'Analisar, gerar SHA-256 e registrar'}</button>{notice && <p style={styles.notice}>{notice}</p>}</div>
       <div style={styles.panel}><h2>Comparação estimada</h2>{report.items.length ? <><div style={styles.summary}><div><small>Total cobrado</small><strong>{money(report.total)}</strong></div><div><small>Referência estimada</small><strong>Não configurada</strong></div></div><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Item</th><th>Cobrado</th><th>Média</th><th>Avaliação</th></tr></thead><tbody>{report.items.map((item, index) => <tr key={`${index}-${item.description}`}><td>{item.description}</td><td>{money(item.amount)}</td><td>{item.avg == null ? 'Não disponível' : money(item.avg)}</td><td style={{ color: item.verdict === 'VERIFICAR DIFERENÇA' ? '#f87171' : item.verdict === 'ACIMA DA REFERÊNCIA' ? '#fbbf24' : '#94a3b8' }}>{item.verdict}</td></tr>)}</tbody></table></div></> : <p style={styles.muted}>Nenhum valor monetário identificado.</p>}<hr style={styles.hr}/><p style={styles.label}>Documento: {report.fileName}</p><p style={styles.label}>SHA-256 do arquivo</p><code style={styles.hash}>{fileHash || 'Aguardando análise'}</code><p style={styles.warning}>Não há integração de cotação de mercado. A extração pode incluir números que não são preços e duplicar totais; confira manualmente. PDFs como imagem precisam de OCR.</p></div>
     </section>}
-    {tab === 'audit' && <section style={{ ...styles.panel, ...styles.wide }}><div style={styles.row}><div><h2>Trilha de auditoria</h2><p style={styles.muted}>Eventos encadeados por SHA-256 no banco SQLite.</p></div><button style={styles.secondary} onClick={exportReport}>Exportar CSV</button></div>{records.length ? <div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Evento</th><th>Tipo</th><th>Responsável</th><th>Documento</th><th>Data</th><th>Hash</th></tr></thead><tbody>{records.map((row) => <tr key={row.seq}><td>{row.log}</td><td>{row.kind}</td><td>{row.actor}</td><td>{row.data?.fileName || row.data?.text || '—'}</td><td>{new Date(row.ts).toLocaleString('pt-BR')}</td><td><code title={row.hash}>{String(row.hash).slice(0, 16)}…</code></td></tr>)}</tbody></table></div> : <p style={styles.muted}>Ainda não há eventos para o seu perfil.</p>}</section>}
-    {tab === 'tools' && <section style={{ ...styles.panel, ...styles.wide }}><h2>Ferramentas de revisão e integridade</h2><div style={styles.grid}><article style={styles.panel}><h3>Revisão de texto com IA</h3><p style={styles.muted}>Sugere correções de ortografia e gramática no texto colado/carregado. A IA não deve modificar fatos ou valores. A aplicação da sugestão exige sua confirmação.</p><button style={styles.primary} disabled={busy || !aiEnabled} onClick={reviewWithAI}>{busy ? 'Revisando…' : 'Gerar sugestão de revisão'}</button>{!aiEnabled && <p style={styles.warning}>Recurso desligado: o administrador precisa configurar OPENAI_API_KEY no servidor.</p>}{aiReview && <><label style={styles.label}>Sugestão (não aplicada)</label><textarea readOnly value={aiReview.textoSugerido} rows={8} style={styles.textarea}/>{aiReview.observacoes?.length > 0 && <ul>{aiReview.observacoes.map((note,i)=><li key={i}>{note}</li>)}</ul>}<button style={styles.primary} onClick={() => { setContent(aiReview.textoSugerido); setAiReview(null); setNotice('Sugestão copiada para o editor. Ainda não foi registrada como auditoria; revise e gere uma nova análise quando quiser.'); }}>Usar sugestão no editor</button></>}</article><article style={styles.panel}><h3>Verificar integridade da cadeia</h3><p style={styles.muted}>Recalcula os hashes e confere os vínculos entre eventos armazenados.</p><button style={styles.primary} disabled={busy || session.user.role !== 'ceo'} onClick={verifyIntegrity}>Verificar cadeia SHA-256</button>{session.user.role !== 'ceo' && <p style={styles.warning}>Disponível apenas para a diretoria.</p>}{integrity && <p style={{ color: integrity.ok ? '#34d399' : '#f87171' }}>{integrity.ok ? `Cadeia válida: ${integrity.verifiedEvents} eventos verificados.` : `Falha no evento ${integrity.seq}: ${integrity.reason}`}</p>}</article><article style={styles.panel}><h3>Exportar auditoria</h3><p style={styles.muted}>Baixe a lista de eventos do seu perfil como CSV, incluindo hashes disponíveis.</p><button style={styles.secondary} onClick={exportReport}>Baixar CSV</button></article></div>{notice && <p style={styles.notice}>{notice}</p>}</section>}
+    {tab === 'audit' && <section style={{ ...styles.panel, ...styles.wide }}><div style={styles.row}><div><h2>Trilha de auditoria</h2><p style={styles.muted}>Eventos encadeados por SHA-256 no banco SQLite. A exportação inclui somente os eventos carregados.</p></div><button style={styles.secondary} onClick={exportReport}>Exportar CSV</button></div>{records.length ? <div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Evento</th><th>Tipo</th><th>Responsável</th><th>Documento</th><th>Data</th><th>Hash</th></tr></thead><tbody>{records.map((row) => <tr key={row.seq}><td>{row.log}</td><td>{row.kind}</td><td>{row.actor}</td><td>{row.data?.fileName || row.data?.text || '—'}</td><td>{new Date(row.ts).toLocaleString('pt-BR')}</td><td><code title={row.hash}>{String(row.hash).slice(0, 16)}…</code></td></tr>)}</tbody></table></div> : <p style={styles.muted}>Ainda não há eventos para o seu perfil.</p>}{nextBefore && <button style={styles.secondary} disabled={busy} onClick={loadMoreAudit}>Carregar mais eventos</button>}{notice && <p style={styles.notice}>{notice}</p>}</section>}
+    {tab === 'tools' && <section style={{ ...styles.panel, ...styles.wide }}><h2>Ferramentas de revisão e integridade</h2><div style={styles.grid}><article style={styles.panel}><h3>Revisão de texto com IA</h3><p style={styles.muted}>Sugere correções de ortografia e gramática no texto colado/carregado. A IA não deve modificar fatos ou valores. A aplicação da sugestão exige sua confirmação.</p><button style={styles.primary} disabled={busy || !aiEnabled} onClick={reviewWithAI}>{busy ? 'Revisando…' : 'Gerar sugestão de revisão'}</button>{!aiEnabled && <p style={styles.warning}>Recurso desligado: o administrador precisa configurar OPENAI_API_KEY no servidor.</p>}{aiReview && <><label style={styles.label}>Sugestão (não aplicada)</label><textarea readOnly value={aiReview.textoSugerido} rows={8} style={styles.textarea}/>{aiReview.observacoes?.length > 0 && <ul>{aiReview.observacoes.map((note,i)=><li key={i}>{note}</li>)}</ul>}<button style={styles.primary} onClick={() => { setContent(aiReview.textoSugerido); setAiReview(null); setNotice('Sugestão copiada para o editor. Ainda não foi registrada como auditoria; revise e gere uma nova análise quando quiser.'); }}>Usar sugestão no editor</button></>}</article><article style={styles.panel}><h3>Verificar integridade da cadeia</h3><p style={styles.muted}>Recalcula os hashes e confere os vínculos entre eventos armazenados.</p><button style={styles.primary} disabled={busy || session.user.role !== 'ceo'} onClick={verifyIntegrity}>Verificar cadeia SHA-256</button>{session.user.role !== 'ceo' && <p style={styles.warning}>Disponível apenas para a diretoria.</p>}{integrity && <p style={{ color: integrity.ok ? '#34d399' : '#f87171' }}>{integrity.ok ? `Cadeia válida: ${integrity.verifiedEvents} eventos verificados.` : `Falha no evento ${integrity.seq}: ${integrity.reason}`}</p>}</article><article style={styles.panel}><h3>Exportar auditoria</h3><p style={styles.muted}>Baixe os eventos carregados do seu perfil como CSV, incluindo hashes disponíveis.</p><button style={styles.secondary} onClick={exportReport}>Baixar CSV</button></article></div>{notice && <p style={styles.notice}>{notice}</p>}</section>}
     <footer style={styles.footer}>JWB • Valores de mercado demonstrativos; valide antes de decisões financeiras.</footer>
   </main>;
 }
