@@ -1,0 +1,94 @@
+'assistant') || !scopedSectorIds(currentUser).includes(sectorId)) return json(res, 403, { error: 'Setor não autorizado.' });
++      const report = audit(text, fileName);
++      const data = { fileName, fileHash, total: report.total, market: report.market, itemCount: report.items.length, sectorId, userId: currentUser.id, source: isFile ? 'file' : 'text', analysisVersion: 1, notes };
++      const event = appendEvent(`AUD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`, 'document_audited', user.name, data);
++      return json(res, 201, { event, report, text, notes });
+     }
+     if (url.pathname === '/api/ai/review' && req.method === 'POST') {
+       if (!process.env.OPENAI_API_KEY) return json(res, 503, { error: 'Revisão por IA não configurada. Defina OPENAI_API_KEY no ambiente do servidor.' });
+diff --git a/src/App.jsx b/src/App.jsx
+index 36682c2..e2b8eee 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -1,38 +1,12 @@
+ import React, { useCallback, useEffect, useState } from 'react';
+ const STORE_KEY = 'jwb_session_v4';
+ const money = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value) || 0);
+-function parseMoney(value) { return Number(String(value).replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.')); }
+-async function sha256(data) {
+-  const bytes = data instanceof ArrayBuffer ? data : new TextEncoder().encode(data);
+-  const hash = await crypto.subtle.digest('SHA-256', bytes);
+-  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
+-}
+-function audit(text, fileName) {
+-  const items = [];
+-  const rx = /(?:R\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2}|\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2})/g;
+-  for (const line of text.split(/\r?\n/).filter(Boolean)) for (const match of line.matchAll(rx)) {
+-    const raw = match[1];
+-    const amount = raw.includes(',') && (!raw.includes('.') || raw.lastIndexOf(',') > raw.lastIndexOf('.')) ? parseMoney(raw) : Number(raw.replace(/,/g, ''));
+-    if (!Number.isFinite(amount) || amount <= 0) continue;
+-    const bench = null;
+-    const avg = bench?.avg ?? null;
+-    const fair = bench?.fair ?? null;
+-    const delta = avg ? Math.round((amount - avg) / avg * 100) : null;
+-    const verdict = !bench ? 'SEM REFERÊNCIA' : amount > fair && delta > 25 ? 'VERIFICAR DIFERENÇA' : amount > fair || delta > 10 ? 'ACIMA DA REFERÊNCIA' : 'DENTRO DA REFERÊNCIA';
+-    items.push({ description: line.trim().slice(0, 240), amount, avg, fair, delta, verdict, category: bench?.category || 'Item sem categoria' });
+-  }
+-  return { fileName, items, total: items.reduce((sum, item) => sum + item.amount, 0), market: items.reduce((sum, item) => sum + (item.avg || 0), 0) };
+-}
+-async function extractFile(file, token) {
++async function encodeFile(file) {
+   if (!file || file.size > 2_000_000) throw new Error('O arquivo deve ter no máximo 2 MB.');
+-  const bytes = await file.arrayBuffer();
+-  const binary = new Uint8Array(bytes);
++  const binary = new Uint8Array(await file.arrayBuffer());
+   let encoded = '';
+   for (let i = 0; i < binary.length; i += 16384) encoded += String.fromCharCode(...binary.subarray(i, i + 16384));
+-  const result = await request('/api/documents/extract', token, { method: 'POST', body: JSON.stringify({ name: file.name, base64: btoa(encoded) }) });
+-  const localHash = await sha256(bytes);
+-  if (result.fileHash !== localHash) throw new Error('Hash do arquivo não corresponde ao recebido no servidor.');
+-  return { bytes, text: result.text, notes: result.notes || [] };
++  return { name: file.name, base64: btoa(encoded) };
+ }
+ 
+ async function request(path, token, options = {}) {
+@@ -50,9 +24,10 @@ export default function App() {
+   const [password, setPassword] = useState('');
+   const [tab, setTab] = useState('dashboard');
+   const [content, setContent] = useState('');
+-  const [report, setReport] = useState(() => audit('', 'Nenhum documento')); 
++  const [report, setReport] = useState({ fileName: 'Nenhum documento', items: [], total: 0, market: 0 });
+   const [fileHash, setFileHash] = useState('');
+   const [sectors, setSectors] = useState([]);
++  const [selectedSector, setSelectedSector] = useState('');
+   const [records, setRecords] = useState([]);
+   const [nextBefore, setNextBefore] = useState(null);
+   const [employees, setEmployees] = useState([]);
+@@ -88,7 +63,7 @@ export default function App() {
+     catch (error) { setNotice(error.message); }
+     finally { setBusy(false); }
+   }
+-  function logout() { setSession(null); setRecords([]); setNextBefore(null); setSectors([]); setEmployees([]); localStorage.removeItem(STORE_KEY); }
++  function logout() { setSession(null); setRecords([]); setNextBefore(null); setSectors([]); setSelectedSector(''); setEmployees([]); setContent(''); clearReport(); setAiReview(null); setIntegrity(null); localStorage.removeItem(STORE_KEY); }
+   async function reviewWithAI() {
+     if (!window.confirm('O texto atual será enviado ao provedor de IA configurado. Não envie dados confidenciais sem autorização. Deseja continuar?')) return;
+     setBusy(true); setNotice(''); setAiReview(null);
+@@ -118,25 +93,23 @@ export default function App() {
+     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+     const link = document.createElement('a'); link.href = url; link.download = 'jwb-trilha-auditoria.csv'; link.click(); URL.revokeObjectURL(url);
+   }
+-  async function analyze(text = content, name = 'texto-colado.txt', exactBytes = null, extractionNotes = []) {
+-    if (!text.trim()) { setNotice(['O documento está vazio ou não contém texto extraível.', ...extractionNotes].join(' ')); setBusy(false); return; }
+-    setBusy(true); setNotice('');
++  function clearReport() {
++    setReport({ fileName: 'Nenhum documento', items: [], total: 0, market: 0 });
++    setFileHash('');
++  }
++  async function analyze(file = null) {
++    if (!file && !content.trim()) { setNotice('Informe um texto para analisar.'); return; }
++    setBusy(true); setNotice('Processando documento…'); clearReport();
+     try {
+-      const hash = await sha256(exactBytes || text);
+-      const nextReport = audit(text, name);
+-      setContent(text); setReport(nextReport); setFileHash(hash);
+-      const logged = await request('/api/audit', session.token, { method: 'POST', body: JSON.stringify({ fileName: name, fileHash: hash, total: nextReport.total, market: nextReport.market, itemCount: nextReport.items.length, sectorId: sectors[0]?.
