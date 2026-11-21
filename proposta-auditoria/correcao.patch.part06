@@ -1,0 +1,14 @@
+});
++  assert.equal(truncated.status, 201);
++  assert.ok((await truncated.json()).event.data.notes.some((note) => note.includes('truncado')));
+   const managerLogin = await request(`${base}/api/login`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email: 'carlos@demo.com', password: 'trocar-esta-senha' }) });
+   assert.equal(managerLogin.status, 200);
+   const managerToken = (await managerLogin.json()).token;
++  assert.equal((await postAudit({ text: 'Teste 1,00', sectorId: 'financeiro' }, { ...jsonHeaders, authorization: `Bearer ${managerToken}` })).status, 403);
++  const badDocument = await postAudit({ name: 'teste.xyz', base64: document.toString('base64'), sectorId: 'operacoes' });
++  assert.equal(badDocument.status, 422);
++  const concurrent = await Promise.all(Array.from({ length: 6 }, (_, index) => postAudit({ text: `Paralelo ${index},00`, sectorId: 'operacoes' })));
++  assert.ok(concurrent.every((response) => response.status === 201));
+   const managerRows = (await (await request(`${base}/api/audit`, { headers: { authorization: `Bearer ${managerToken}` } })).json()).records;
+   assert.ok(managerRows.length >= 1);
+   assert.ok(managerRows.every((row) => row.data.sectorId === 'operacoes' || row.log === 'LOG-904'));
