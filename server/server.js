@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { SECTORS, EMPLOYEES, USERS, RBAC, EVENTS } from './seed.js';
+import { audit } from './audit.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT) || 3001;
@@ -45,12 +46,19 @@ const issue = (user) => {
   return `${payload}.${mac(payload)}`;
 };
 const lastEvent = db.prepare('SELECT hash FROM events ORDER BY seq DESC LIMIT 1');
-function appendEvent(logId, kind, actor, data, ts = new Date().toISOString()) {
-  const prevHash = lastEvent.get()?.hash || 'GENESIS';
-  const hash = sha(JSON.stringify({ logId, kind, actor, data, ts, prevHash }));
-  db.prepare('INSERT INTO events(log_id, kind, actor, data, ts, prev_hash, hash) VALUES (?,?,?,?,?,?,?)')
-    .run(logId, kind, actor, JSON.stringify(data), ts, prevHash, hash);
-  return hash;
+function appendEvent(logId, kind, actor, data, ts = new Date().toISOString(), inTransaction = false) {
+  if (!inTransaction) db.exec('BEGIN IMMEDIATE');
+  try {
+    const prevHash = lastEvent.get()?.hash || 'GENESIS';
+    const hash = sha(JSON.stringify({ logId, kind, actor, data, ts, prevHash }));
+    const result = db.prepare('INSERT INTO events(log_id, kind, actor, data, ts, prev_hash, hash) VALUES (?,?,?,?,?,?,?)')
+      .run(logId, kind, actor, JSON.stringify(data), ts, prevHash, hash);
+    if (!inTransaction) db.exec('COMMIT');
+    return { seq: Number(result.lastInsertRowid), log: logId, kind, actor, data, ts, prevHash, hash };
+  } catch (error) {
+    if (!inTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
 }
 function auditChain() {
   let prevHash = 'GENESIS';
@@ -93,7 +101,7 @@ if (!db.prepare('SELECT 1 FROM users LIMIT 1').get()) {
       const data = DEMO ? sector : { id: sector.id, name: sector.name, description: 'Setor a configurar pela empresa', manager: '', budget: null, baseSpent: null };
       insertSector.run(sector.id, JSON.stringify(data));
     }
-    if (DEMO) for (const event of EVENTS) appendEvent(event.log, event.kind, event.actor, event.data, new Date(Date.now() - event.h * 3600e3).toISOString());
+    if (DEMO) for (const event of EVENTS) appendEvent(event.log, event.kind, event.actor, event.data, new Date(Date.now() - event.h * 3600e3).toISOString(), true);
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 }
@@ -145,6 +153,20 @@ async function serveFrontend(req, res, pathname) {
     res.writeHead(200, { 'Content-Type': MIME[path.extname(filename)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': filename.endsWith('index.html') ? 'no-cache' : 'public, max-age=31536000, immutable' });
     res.end(contents); return true;
   } catch { return false; }
+}
+
+async function extractDocument(name, base64) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.env.PYTHON_BIN || 'python3', [path.join(ROOT, 'python_engine', 'extract.py')], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let output = ''; let errorOutput = ''; let settled = false;
+    const timer = setTimeout(() => { child.kill('SIGKILL'); if (!settled) { settled = true; reject(new Error('Processamento excedeu 30 segundos.')); } }, 30_000);
+    child.stdout.on('data', (chunk) => { output += chunk; if (output.length > 1_000_000) child.kill('SIGKILL'); });
+    child.stderr.on('data', (chunk) => { if (errorOutput.length < 1000) errorOutput += chunk.toString().slice(0, 1000 - errorOutput.length); });
+    child.on('error', (error) => { clearTimeout(timer); if (!settled) { settled = true; reject(error); } });
+    child.on('close', () => { clearTimeout(timer); if (settled) return; settled = true; try { resolve(JSON.parse(output)); } catch { reject(new Error(errorOutput || 'Extrator Python indisponível.')); } });
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify({ name, base64 }));
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -201,17 +223,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/documents/extract' && req.method === 'POST') {
       if (typeof body.name !== 'string' || typeof body.base64 !== 'string' || body.base64.length > 2_666_672) return json(res, 400, { error: 'Arquivo inválido ou acima de 2 MB.' });
       try {
-        const result = await new Promise((resolve, reject) => {
-          const child = spawn(process.env.PYTHON_BIN || 'python3', [path.join(ROOT, 'python_engine', 'extract.py')], { stdio: ['pipe', 'pipe', 'pipe'] });
-          let output = ''; let errorOutput = ''; let settled = false;
-          const timer = setTimeout(() => { child.kill('SIGKILL'); if (!settled) { settled = true; reject(new Error('Processamento excedeu 30 segundos.')); } }, 30_000);
-          child.stdout.on('data', (chunk) => { output += chunk; if (output.length > 1_000_000) child.kill('SIGKILL'); });
-          child.stderr.on('data', (chunk) => { errorOutput += chunk.toString().slice(0, 1000); });
-          child.on('error', (err) => { clearTimeout(timer); if (!settled) { settled = true; reject(err); } });
-          child.on('close', () => { clearTimeout(timer); if (settled) return; settled = true; try { resolve(JSON.parse(output)); } catch { reject(new Error(errorOutput || 'Extrator Python indisponível.')); } });
-          child.stdin.on('error', () => {});
-          child.stdin.end(JSON.stringify({ name: body.name.slice(0, 200), base64: body.base64 }));
-        });
+        const result = await extractDocument(body.name.slice(0, 200), body.base64);
         if (!result.ok) return json(res, 422, { error: result.error || 'Falha na extração.' });
         return json(res, 200, result);
       } catch (error) { console.error('Document processor error:', error.message); return json(res, 503, { error: 'Processador de documentos indisponível.' }); }
@@ -241,15 +253,37 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { records: page, nextBefore: hasMore ? page[page.length - 1].seq : null });
     }
     if (url.pathname === '/api/audit' && req.method === 'POST') {
-      if (typeof body.fileName !== 'string' || typeof body.fileHash !== 'string' || !/^[a-f0-9]{64}$/i.test(body.fileHash)) return json(res, 400, { error: 'Nome do arquivo e hash SHA-256 válido são obrigatórios.' });
       if (!DEMO && user.role === 'assistant') return json(res, 403, { error: 'Este perfil não pode registrar auditorias em produção.' });
-      const logId = `AUD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      const allowed = scopedSectorIds(user);
-      const requestedSector = String(body.sectorId || '');
-      const sectorId = allowed.includes(requestedSector) ? requestedSector : (allowed[0] || '');
-      const data = { fileName: body.fileName.slice(0, 200), fileHash: body.fileHash.toLowerCase(), total: Number.isFinite(Number(body.total)) ? Number(body.total) : 0, market: Number.isFinite(Number(body.market)) ? Number(body.market) : 0, itemCount: Math.max(0, Number(body.itemCount) || 0), sectorId };
-      const hash = appendEvent(logId, 'document_audited', user.name, data);
-      return json(res, 201, { log: logId, hash, ts: new Date().toISOString() });
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !['name', 'base64', 'text', 'sectorId'].includes(key))) return json(res, 400, { error: 'Envie somente o documento ou texto e o setor; resultados não são aceitos do cliente.' });
+      const sectorId = body.sectorId;
+      if (typeof sectorId !== 'string' || !scopedSectorIds(user).includes(sectorId)) return json(res, 403, { error: 'Setor não autorizado.' });
+      const isFile = typeof body.base64 === 'string' && typeof body.name === 'string' && body.text === undefined;
+      const isText = typeof body.text === 'string' && body.name === undefined && body.base64 === undefined;
+      if (!isFile && !isText) return json(res, 400, { error: 'Envie um arquivo ou um texto, não ambos.' });
+      let text, fileName, fileHash, notes = [];
+      if (isFile) {
+        if (!body.name.trim() || body.name.length > 200 || body.base64.length > 2_666_668 || !/^[A-Za-z0-9+/]*={0,2}$/.test(body.base64)) return json(res, 400, { error: 'Arquivo inválido ou acima de 2 MB.' });
+        const bytes = Buffer.from(body.base64, 'base64');
+        if (!bytes.length || bytes.length > 2_000_000 || bytes.toString('base64') !== body.base64) return json(res, 400, { error: 'Arquivo inválido ou acima de 2 MB.' });
+        fileHash = sha(bytes);
+        let extracted;
+        try { extracted = await extractDocument(body.name, body.base64); }
+        catch (error) { console.error('Document processor error:', error.message); return json(res, 503, { error: 'Processador de documentos indisponível.' }); }
+        if (!extracted.ok) return json(res, 422, { error: extracted.error || 'Falha na extração.' });
+        if (extracted.fileHash !== fileHash || typeof extracted.text !== 'string' || !Array.isArray(extracted.notes)) return json(res, 500, { error: 'Falha ao validar a extração.' });
+        text = extracted.text; fileName = extracted.fileName; notes = extracted.notes;
+      } else {
+        if (body.text.length > 200_000 || Buffer.byteLength(body.text, 'utf8') > 2_000_000) return json(res, 400, { error: 'Texto acima do limite de 200 mil caracteres.' });
+        text = body.text; fileName = 'texto-colado.txt'; fileHash = sha(Buffer.from(text, 'utf8'));
+      }
+      if (!text.trim()) return json(res, 422, { error: 'O documento está vazio ou não contém texto extraível. PDFs digitalizados precisam de OCR.' });
+      const currentUser = authenticate(req);
+      if (!currentUser || currentUser.id !== user.id) return json(res, 401, { error: 'Sessão inválida ou expirada. Entre novamente.' });
+      if ((!DEMO && currentUser.role === 'assistant') || !scopedSectorIds(currentUser).includes(sectorId)) return json(res, 403, { error: 'Setor não autorizado.' });
+      const report = audit(text, fileName);
+      const data = { fileName, fileHash, total: report.total, market: report.market, itemCount: report.items.length, sectorId, userId: currentUser.id, source: isFile ? 'file' : 'text', analysisVersion: 1, notes };
+      const event = appendEvent(`AUD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`, 'document_audited', user.name, data);
+      return json(res, 201, { event, report, text, notes });
     }
     if (url.pathname === '/api/ai/review' && req.method === 'POST') {
       if (!process.env.OPENAI_API_KEY) return json(res, 503, { error: 'Revisão por IA não configurada. Defina OPENAI_API_KEY no ambiente do servidor.' });

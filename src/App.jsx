@@ -1,38 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
 const STORE_KEY = 'jwb_session_v4';
 const money = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value) || 0);
-function parseMoney(value) { return Number(String(value).replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.')); }
-async function sha256(data) {
-  const bytes = data instanceof ArrayBuffer ? data : new TextEncoder().encode(data);
-  const hash = await crypto.subtle.digest('SHA-256', bytes);
-  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-function audit(text, fileName) {
-  const items = [];
-  const rx = /(?:R\$\s*)?(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2}|\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2})/g;
-  for (const line of text.split(/\r?\n/).filter(Boolean)) for (const match of line.matchAll(rx)) {
-    const raw = match[1];
-    const amount = raw.includes(',') && (!raw.includes('.') || raw.lastIndexOf(',') > raw.lastIndexOf('.')) ? parseMoney(raw) : Number(raw.replace(/,/g, ''));
-    if (!Number.isFinite(amount) || amount <= 0) continue;
-    const bench = null;
-    const avg = bench?.avg ?? null;
-    const fair = bench?.fair ?? null;
-    const delta = avg ? Math.round((amount - avg) / avg * 100) : null;
-    const verdict = !bench ? 'SEM REFERÊNCIA' : amount > fair && delta > 25 ? 'VERIFICAR DIFERENÇA' : amount > fair || delta > 10 ? 'ACIMA DA REFERÊNCIA' : 'DENTRO DA REFERÊNCIA';
-    items.push({ description: line.trim().slice(0, 240), amount, avg, fair, delta, verdict, category: bench?.category || 'Item sem categoria' });
-  }
-  return { fileName, items, total: items.reduce((sum, item) => sum + item.amount, 0), market: items.reduce((sum, item) => sum + (item.avg || 0), 0) };
-}
-async function extractFile(file, token) {
+async function encodeFile(file) {
   if (!file || file.size > 2_000_000) throw new Error('O arquivo deve ter no máximo 2 MB.');
-  const bytes = await file.arrayBuffer();
-  const binary = new Uint8Array(bytes);
+  const binary = new Uint8Array(await file.arrayBuffer());
   let encoded = '';
   for (let i = 0; i < binary.length; i += 16384) encoded += String.fromCharCode(...binary.subarray(i, i + 16384));
-  const result = await request('/api/documents/extract', token, { method: 'POST', body: JSON.stringify({ name: file.name, base64: btoa(encoded) }) });
-  const localHash = await sha256(bytes);
-  if (result.fileHash !== localHash) throw new Error('Hash do arquivo não corresponde ao recebido no servidor.');
-  return { bytes, text: result.text, notes: result.notes || [] };
+  return { name: file.name, base64: btoa(encoded) };
 }
 
 async function request(path, token, options = {}) {
@@ -50,9 +24,10 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [tab, setTab] = useState('dashboard');
   const [content, setContent] = useState('');
-  const [report, setReport] = useState(() => audit('', 'Nenhum documento')); 
+  const [report, setReport] = useState({ fileName: 'Nenhum documento', items: [], total: 0, market: 0 });
   const [fileHash, setFileHash] = useState('');
   const [sectors, setSectors] = useState([]);
+  const [selectedSector, setSelectedSector] = useState('');
   const [records, setRecords] = useState([]);
   const [nextBefore, setNextBefore] = useState(null);
   const [employees, setEmployees] = useState([]);
@@ -88,7 +63,7 @@ export default function App() {
     catch (error) { setNotice(error.message); }
     finally { setBusy(false); }
   }
-  function logout() { setSession(null); setRecords([]); setNextBefore(null); setSectors([]); setEmployees([]); localStorage.removeItem(STORE_KEY); }
+  function logout() { setSession(null); setRecords([]); setNextBefore(null); setSectors([]); setSelectedSector(''); setEmployees([]); setContent(''); clearReport(); setAiReview(null); setIntegrity(null); localStorage.removeItem(STORE_KEY); }
   async function reviewWithAI() {
     if (!window.confirm('O texto atual será enviado ao provedor de IA configurado. Não envie dados confidenciais sem autorização. Deseja continuar?')) return;
     setBusy(true); setNotice(''); setAiReview(null);
@@ -118,25 +93,23 @@ export default function App() {
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a'); link.href = url; link.download = 'jwb-trilha-auditoria.csv'; link.click(); URL.revokeObjectURL(url);
   }
-  async function analyze(text = content, name = 'texto-colado.txt', exactBytes = null, extractionNotes = []) {
-    if (!text.trim()) { setNotice(['O documento está vazio ou não contém texto extraível.', ...extractionNotes].join(' ')); setBusy(false); return; }
-    setBusy(true); setNotice('');
+  function clearReport() {
+    setReport({ fileName: 'Nenhum documento', items: [], total: 0, market: 0 });
+    setFileHash('');
+  }
+  async function analyze(file = null) {
+    if (!file && !content.trim()) { setNotice('Informe um texto para analisar.'); return; }
+    setBusy(true); setNotice('Processando documento…'); clearReport();
     try {
-      const hash = await sha256(exactBytes || text);
-      const nextReport = audit(text, name);
-      setContent(text); setReport(nextReport); setFileHash(hash);
-      const logged = await request('/api/audit', session.token, { method: 'POST', body: JSON.stringify({ fileName: name, fileHash: hash, total: nextReport.total, market: nextReport.market, itemCount: nextReport.items.length, sectorId: sectors[0]?.id }) });
-      setRecords((old) => [{ seq: `new-${logged.log}`, log: logged.log, kind: 'document_audited', actor: session.user.name, data: { fileName: name, fileHash: hash, total: nextReport.total, itemCount: nextReport.items.length }, ts: logged.ts, hash: logged.hash }, ...old]);
-      setNotice([`Análise registrada na trilha de auditoria (${logged.log}).`, ...extractionNotes].join(' '));
+      const input = file ? await encodeFile(file) : { text: content };
+      const result = await request('/api/audit', session.token, { method: 'POST', body: JSON.stringify({ ...input, sectorId: selectedSector || sectors[0]?.id }) });
+      setContent(result.text); setReport(result.report); setFileHash(result.event.data.fileHash);
+      setRecords((old) => [result.event, ...old]);
+      setNotice([`Análise registrada na trilha de auditoria (${result.event.log}).`, ...result.notes].join(' '));
     } catch (error) { setNotice(`Não foi possível concluir a análise: ${error.message}`); }
     finally { setBusy(false); }
   }
-  async function handleFile(file) {
-    if (!file) return;
-    setBusy(true); setNotice('Lendo documento…');
-    try { const extracted = await extractFile(file, session.token); await analyze(extracted.text, file.name, extracted.bytes, extracted.notes); }
-    catch (error) { setNotice(`Falha ao ler arquivo: ${error.message}`); setBusy(false); }
-  }
+  function handleFile(file) { if (file) analyze(file); }
 
   if (checking) return <main style={styles.page}><section style={styles.login}><h1>JWB • Sistema Corporativo</h1><p>Verificando sua sessão…</p></section></main>;
   if (!session) return <main style={styles.page}><form onSubmit={login} style={styles.login}><div style={styles.brand}>JWB <span>• Sistema Corporativo</span></div><p style={styles.muted}>Entre para acessar o painel de auditoria.</p><label style={styles.label}>E-mail<input autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} style={styles.input}/></label><label style={styles.label}>Senha<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} style={styles.input}/></label><button style={styles.primary} disabled={busy}>{busy ? 'Entrando…' : 'Entrar'}</button>{notice && <p style={styles.notice}>{notice}</p>}<p style={styles.warning}>Protótipo para avaliação. Não utilize dados confidenciais até concluir a validação de segurança.</p></form></main>;
@@ -146,7 +119,7 @@ export default function App() {
     <nav style={styles.nav}>{[['dashboard', 'Painel'], ['attachments', 'Documentos'], ['audit', `Trilha (${records.length})`], ['tools', 'Ferramentas']].map(([id, label]) => <button key={id} onClick={() => setTab(id)} style={{ ...styles.tab, ...(tab === id ? styles.activeTab : {}) }}>{label}</button>)}</nav>
     {tab === 'dashboard' && <><section style={styles.grid}>{sectors.map((sector) => <article key={sector.id} style={styles.panel}><h2>{sector.name}</h2><p style={styles.muted}>{sector.description}</p>{Number.isFinite(sector.budget) && <p>Orçamento: <strong>{money(sector.budget)}</strong></p>}<small>Responsável: {sector.manager}</small></article>)}</section><section style={{ ...styles.panel, ...styles.wide }}><h2>Resumo</h2><p>{records.length} eventos carregados da trilha de auditoria. Setores disponíveis para seu perfil: {sectors.length}.</p><button style={styles.primary} onClick={() => setTab('attachments')}>Analisar documento</button></section>{employees.length > 0 && <section style={{ ...styles.panel, ...styles.wide }}><h2>Indicadores da equipe</h2><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Colaborador</th><th>Setor</th><th>Pontuação base</th><th>Entrega no prazo</th><th>Status</th></tr></thead><tbody>{employees.map((person) => <tr key={person.id}><td>{person.name}</td><td>{person.sector}</td><td>{person.baseScore}%</td><td>{person.onTimeRate}%</td><td>{person.status}</td></tr>)}</tbody></table></div><p style={styles.warning}>Indicadores de demonstração: confirme as informações antes de usá-las para decisões de pessoal.</p></section>}</>}
     {tab === 'attachments' && <section style={styles.grid}>
-      <div style={styles.panel}><h2>Auditoria de documento</h2><label style={styles.label}>Selecionar PDF, planilha ou texto<input type="file" accept=".pdf,.xlsx,.csv,.tsv,.txt,application/pdf,text/csv" onChange={(event) => handleFile(event.target.files?.[0])} style={styles.file}/></label><p style={styles.muted}>PDF com texto selecionável, XLSX, CSV, TSV e TXT. XLS e ODS devem ser convertidos para XLSX.</p><label style={styles.label} htmlFor="doc">Ou cole o texto</label><textarea id="doc" value={content} onChange={(event) => setContent(event.target.value)} rows={12} style={styles.textarea}/><button style={styles.primary} disabled={busy} onClick={() => analyze(content)}>{busy ? 'Processando…' : 'Analisar, gerar SHA-256 e registrar'}</button>{notice && <p style={styles.notice}>{notice}</p>}</div>
+      <div style={styles.panel}><h2>Auditoria de documento</h2><label style={styles.label}>Setor<select style={styles.input} value={selectedSector || sectors[0]?.id || ''} disabled={busy} onChange={(event) => setSelectedSector(event.target.value)}>{sectors.map((sector) => <option key={sector.id} value={sector.id}>{sector.name}</option>)}</select></label><label style={styles.label}>Selecionar PDF, planilha ou texto<input type="file" disabled={busy || !sectors.length} accept=".pdf,.xlsx,.csv,.tsv,.txt,application/pdf,text/csv" onChange={(event) => { handleFile(event.target.files?.[0]); event.target.value = ''; }} style={styles.file}/></label><p style={styles.muted}>PDF com texto selecionável, XLSX, CSV, TSV e TXT. XLS e ODS devem ser convertidos para XLSX.</p><label style={styles.label} htmlFor="doc">Ou cole o texto</label><textarea id="doc" value={content} disabled={busy} onChange={(event) => { setContent(event.target.value); clearReport(); setNotice('Texto alterado. A próxima análise registrará o texto, não o arquivo original.'); }} rows={12} style={styles.textarea}/><button style={styles.primary} disabled={busy || !sectors.length} onClick={() => analyze()}>{busy ? 'Processando…' : 'Analisar, gerar SHA-256 e registrar'}</button>{notice && <p style={styles.notice}>{notice}</p>}</div>
       <div style={styles.panel}><h2>Comparação estimada</h2>{report.items.length ? <><div style={styles.summary}><div><small>Total cobrado</small><strong>{money(report.total)}</strong></div><div><small>Referência estimada</small><strong>Não configurada</strong></div></div><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Item</th><th>Cobrado</th><th>Média</th><th>Avaliação</th></tr></thead><tbody>{report.items.map((item, index) => <tr key={`${index}-${item.description}`}><td>{item.description}</td><td>{money(item.amount)}</td><td>{item.avg == null ? 'Não disponível' : money(item.avg)}</td><td style={{ color: item.verdict === 'VERIFICAR DIFERENÇA' ? '#f87171' : item.verdict === 'ACIMA DA REFERÊNCIA' ? '#fbbf24' : '#94a3b8' }}>{item.verdict}</td></tr>)}</tbody></table></div></> : <p style={styles.muted}>Nenhum valor monetário identificado.</p>}<hr style={styles.hr}/><p style={styles.label}>Documento: {report.fileName}</p><p style={styles.label}>SHA-256 do arquivo</p><code style={styles.hash}>{fileHash || 'Aguardando análise'}</code><p style={styles.warning}>Não há integração de cotação de mercado. A extração pode incluir números que não são preços e duplicar totais; confira manualmente. PDFs como imagem precisam de OCR.</p></div>
     </section>}
     {tab === 'audit' && <section style={{ ...styles.panel, ...styles.wide }}><div style={styles.row}><div><h2>Trilha de auditoria</h2><p style={styles.muted}>Eventos encadeados por SHA-256 no banco SQLite. A exportação inclui somente os eventos carregados.</p></div><button style={styles.secondary} onClick={exportReport}>Exportar CSV</button></div>{records.length ? <div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Evento</th><th>Tipo</th><th>Responsável</th><th>Documento</th><th>Data</th><th>Hash</th></tr></thead><tbody>{records.map((row) => <tr key={row.seq}><td>{row.log}</td><td>{row.kind}</td><td>{row.actor}</td><td>{row.data?.fileName || row.data?.text || '—'}</td><td>{new Date(row.ts).toLocaleString('pt-BR')}</td><td><code title={row.hash}>{String(row.hash).slice(0, 16)}…</code></td></tr>)}</tbody></table></div> : <p style={styles.muted}>Ainda não há eventos para o seu perfil.</p>}{nextBefore && <button style={styles.secondary} disabled={busy} onClick={loadMoreAudit}>Carregar mais eventos</button>}{notice && <p style={styles.notice}>{notice}</p>}</section>}
