@@ -30,9 +30,7 @@ Os demais usuários demonstrativos são `carlos@demo.com`, `fernanda@demo.com` e
 ## Funcionalidades e limites
 
 - Login, setores e trilha de auditoria usam a API e banco SQLite local (`jwb.db`). O projeto é um protótipo e não está validado para dados reais ou produção.
-- A API calcula o SHA-256, extrai e analisa o conteúdo no servidor e registra metadados e resultados resumidos em eventos encadeados. Resultados e hashes enviados pelo cliente são rejeitados.
-- A API de auditoria mudou: `POST /api/audit` recebe `{ "name": "documento.txt", "base64": "...", "sectorId": "..." }` ou `{ "text": "...", "sectorId": "..." }`. A resposta contém `event`, `report`, `text` e `notes`; clientes antigos precisam ser atualizados. O texto colado é identificado por SHA-256 de seus bytes UTF-8; o arquivo é identificado pelo hash de seus bytes originais.
-- O sistema não conserva o arquivo original nem os itens detalhados no evento: guarde a fonte separadamente com controles adequados caso seja necessário reproduzir a análise. Em extração truncada, o hash cobre o arquivo inteiro, mas os resultados cobrem apenas o texto extraído; consulte os avisos do evento.
+- Cada arquivo auditado registra metadados e hash SHA-256 em eventos encadeados.
 - Importa XLSX, CSV, TSV e TXT (converta XLS e ODS para XLSX); PDFs com camada de texto também são lidos pelo processador Python. O limite é 2 MB por arquivo. PDF digitalizado como imagem exige OCR, que não está incluído.
 - Não existe cotação de mercado integrada. A análise pode identificar números indevidos ou duplicar totais, exigindo conferência humana.
 - A revisão com IA é opcional e **sugestiva**: exige `OPENAI_API_KEY` no servidor; nunca aplica alterações sem confirmação humana. O texto enviado é transmitido ao provedor de IA configurado.
