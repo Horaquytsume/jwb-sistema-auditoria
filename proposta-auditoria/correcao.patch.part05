@@ -1,0 +1,64 @@
+<small>Referência estimada</small><strong>Não configurada</strong></div></div><div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Item</th><th>Cobrado</th><th>Média</th><th>Avaliação</th></tr></thead><tbody>{report.items.map((item, index) => <tr key={`${index}-${item.description}`}><td>{item.description}</td><td>{money(item.amount)}</td><td>{item.avg == null ? 'Não disponível' : money(item.avg)}</td><td style={{ color: item.verdict === 'VERIFICAR DIFERENÇA' ? '#f87171' : item.verdict === 'ACIMA DA REFERÊNCIA' ? '#fbbf24' : '#94a3b8' }}>{item.verdict}</td></tr>)}</tbody></table></div></> : <p style={styles.muted}>Nenhum valor monetário identificado.</p>}<hr style={styles.hr}/><p style={styles.label}>Documento: {report.fileName}</p><p style={styles.label}>SHA-256 do arquivo</p><code style={styles.hash}>{fileHash || 'Aguardando análise'}</code><p style={styles.warning}>Não há integração de cotação de mercado. A extração pode incluir números que não são preços e duplicar totais; confira manualmente. PDFs como imagem precisam de OCR.</p></div>
+     </section>}
+     {tab === 'audit' && <section style={{ ...styles.panel, ...styles.wide }}><div style={styles.row}><div><h2>Trilha de auditoria</h2><p style={styles.muted}>Eventos encadeados por SHA-256 no banco SQLite. A exportação inclui somente os eventos carregados.</p></div><button style={styles.secondary} onClick={exportReport}>Exportar CSV</button></div>{records.length ? <div style={{ overflowX: 'auto' }}><table style={styles.table}><thead><tr><th>Evento</th><th>Tipo</th><th>Responsável</th><th>Documento</th><th>Data</th><th>Hash</th></tr></thead><tbody>{records.map((row) => <tr key={row.seq}><td>{row.log}</td><td>{row.kind}</td><td>{row.actor}</td><td>{row.data?.fileName || row.data?.text || '—'}</td><td>{new Date(row.ts).toLocaleString('pt-BR')}</td><td><code title={row.hash}>{String(row.hash).slice(0, 16)}…</code></td></tr>)}</tbody></table></div> : <p style={styles.muted}>Ainda não há eventos para o seu perfil.</p>}{nextBefore && <button style={styles.secondary} disabled={busy} onClick={loadMoreAudit}>Carregar mais eventos</button>}{notice && <p style={styles.notice}>{notice}</p>}</section>}
+diff --git a/test.js b/test.js
+index bb45c08..935a82d 100644
+--- a/test.js
++++ b/test.js
+@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
+ import { spawn } from 'node:child_process';
+ import { once } from 'node:events';
+ import http from 'node:http';
++import crypto from 'node:crypto';
+ import { mkdtemp, rm } from 'node:fs/promises';
+ import os from 'node:os';
+ import path from 'node:path';
+@@ -63,15 +64,29 @@ try {
+   const sectors = await (await request(`${base}/api/sectors`, { headers: authHeaders })).json();
+   assert.equal(sectors.length, 4);
+   const fileHash = 'a'.repeat(64);
+-  const extracted = await request(`${base}/api/documents/extract`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ name: 'teste.txt', base64: Buffer.from('Teste R$ 12,50').toString('base64') }) });
++  const document = Buffer.from('Teste R$ 12,50');
++  const expectedHash = crypto.createHash('sha256').update(document).digest('hex');
++  const extracted = await request(`${base}/api/documents/extract`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ name: 'teste.txt', base64: document.toString('base64') }) });
+   assert.equal(extracted.status, 200, 'API deve executar o extrator Python');
+   const extractedBody = await extracted.json();
+   assert.equal(extractedBody.text, 'Teste R$ 12,50');
+-  assert.match(extractedBody.fileHash, /^[a-f0-9]{64}$/);
+-  const auditResponse = await request(`${base}/api/audit`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ fileName: 'teste.csv', fileHash, total: 12.5, market: 10, itemCount: 1 }) });
++  assert.equal(extractedBody.fileHash, expectedHash);
++  const postAudit = (data, headers = authHeaders) => request(`${base}/api/audit`, { method: 'POST', headers, body: JSON.stringify(data) });
++  assert.equal((await postAudit({ fileName: 'teste.csv', fileHash, total: 999, itemCount: 1, sectorId: 'operacoes' })).status, 400, 'Rejeitar contrato antigo falsificável');
++  assert.equal((await postAudit({ name: 'teste.txt', base64: document.toString('base64'), total: 999, sectorId: 'operacoes' })).status, 400, 'Rejeitar resultados do cliente');
++  assert.equal((await postAudit({ name: 'teste.txt', base64: '!!!', sectorId: 'operacoes' })).status, 400);
++  assert.equal((await postAudit({ text: '   ', sectorId: 'operacoes' })).status, 422);
++  assert.equal((await postAudit({ text: 'x'.repeat(200001), sectorId: 'operacoes' })).status, 400);
++  const auditResponse = await postAudit({ name: 'teste.txt', base64: document.toString('base64'), sectorId: 'operacoes' });
+   assert.equal(auditResponse.status, 201);
+-  const inserted = await auditResponse.json();
++  const insertedResult = await auditResponse.json();
++  const inserted = insertedResult.event;
+   assert.match(inserted.hash, /^[a-f0-9]{64}$/);
++  assert.equal(inserted.data.fileHash, expectedHash);
++  assert.equal(inserted.data.total, 12.5);
++  assert.equal(inserted.data.itemCount, 1);
++  assert.equal(inserted.data.source, 'file');
++  assert.equal(insertedResult.report.total, 12.5);
+   const auditPage = await (await request(`${base}/api/audit?limit=1`, { headers: authHeaders })).json();
+   const auditRows = auditPage.records;
+   assert.equal(auditRows.length, 1);
+@@ -81,10 +96,26 @@ try {
+   assert.notEqual(auditRows[0].seq, secondPage.records[0].seq);
+   const invalidPage = await request(`${base}/api/audit?limit=101`, { headers: authHeaders });
+   assert.equal(invalidPage.status, 400);
+-  assert.ok(auditRows.some((row) => row.log === inserted.log && row.data.fileHash === fileHash));
++  assert.ok(auditRows.some((row) => row.log === inserted.log && row.data.fileHash === expectedHash));
++  const pasted = 'ação R$ 1.234,50\r\nOutra 12.25';
++  const textResponse = await postAudit({ text: pasted, sectorId: 'operacoes' });
++  assert.equal(textResponse.status, 201);
++  const textResult = await textResponse.json();
++  assert.equal(textResult.event.data.fileHash, crypto.createHash('sha256').update(Buffer.from(pasted, 'utf8')).digest('hex'));
++  assert.equal(textResult.event.data.total, 1246.75);
++  assert.equal(textResult.event.data.source, 'text');
++  assert.equal(textResult.text, pasted);
++  const truncated = await postAudit({ name: 'longo.txt', base64: Buffer.from('a'.repeat(200001)).toString('base64'), sectorId: 'operacoes' 
