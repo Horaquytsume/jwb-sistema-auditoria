@@ -1,0 +1,1 @@
+A correção está dividida em partes do patch e ainda NÃO foi aplicada aos arquivos do projeto. Para aplicar no diretório raiz: cat proposta-auditoria/correcao.patch.part* | git apply. A mudança de API requer atualizar clientes. Depois de aplicar, execute os testes e a compilação antes de integrar.
